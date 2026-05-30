@@ -117,6 +117,8 @@ pub enum GitBackendInitError {
     Config(ConfigGetError),
     #[error(transparent)]
     Path(PathError),
+    #[error(transparent)]
+    WorkspaceAttributes(crate::git_backend_consumingchaos::WorkspaceAttributesError),
 }
 
 impl From<Box<GitBackendInitError>> for BackendInitError {
@@ -135,6 +137,8 @@ pub enum GitBackendLoadError {
     Config(ConfigGetError),
     #[error(transparent)]
     Path(PathError),
+    #[error(transparent)]
+    WorkspaceAttributes(crate::git_backend_consumingchaos::WorkspaceAttributesError),
 }
 
 impl From<Box<GitBackendLoadError>> for BackendLoadError {
@@ -181,6 +185,7 @@ pub struct GitBackend {
     cached_extra_metadata: Mutex<Option<Arc<ReadonlyTable>>>,
     git_executable: PathBuf,
     write_change_id_header: bool,
+    workspace_attributes: crate::git_backend_consumingchaos::WorkspaceAttributes,
 }
 
 impl GitBackend {
@@ -192,6 +197,7 @@ impl GitBackend {
         base_repo: gix::ThreadSafeRepository,
         extra_metadata_store: TableStore,
         git_settings: GitSettings,
+        workspace_attributes: crate::git_backend_consumingchaos::WorkspaceAttributes,
     ) -> Self {
         let repo = Mutex::new(base_repo.to_thread_local());
         let root_commit_id = CommitId::from_bytes(&[0; HASH_LENGTH]);
@@ -208,6 +214,7 @@ impl GitBackend {
             cached_extra_metadata: Mutex::new(None),
             git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
+            workspace_attributes,
         }
     }
 
@@ -304,7 +311,15 @@ impl GitBackend {
             .context(&target_path)
             .map_err(GitBackendInitError::Path)?;
         let extra_metadata_store = TableStore::init(extra_path, HASH_LENGTH);
-        Ok(Self::new(repo, extra_metadata_store, git_settings))
+        let workspace_attributes =
+            crate::git_backend_consumingchaos::load_workspace_attributes()
+                .map_err(GitBackendInitError::WorkspaceAttributes)?;
+        Ok(Self::new(
+            repo,
+            extra_metadata_store,
+            git_settings,
+            workspace_attributes,
+        ))
     }
 
     pub fn load(
@@ -331,7 +346,15 @@ impl GitBackend {
         let extra_metadata_store = TableStore::load(store_path.join("extra"), HASH_LENGTH);
         let git_settings =
             GitSettings::from_settings(settings).map_err(GitBackendLoadError::Config)?;
-        Ok(Self::new(repo, extra_metadata_store, git_settings))
+        let workspace_attributes =
+            crate::git_backend_consumingchaos::load_workspace_attributes()
+                .map_err(GitBackendLoadError::WorkspaceAttributes)?;
+        Ok(Self::new(
+            repo,
+            extra_metadata_store,
+            git_settings,
+            workspace_attributes,
+        ))
     }
 
     fn lock_git_repo(&self) -> MutexGuard<'_, gix::Repository> {
@@ -1042,17 +1065,25 @@ impl Backend for GitBackend {
         _path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
+        if let Some(data) = crate::git_backend_consumingchaos::read_cdc_file(self, id)? {
+            return Ok(Box::pin(Cursor::new(data)));
+        }
+
         let data = self.read_file_sync(id)?;
         Ok(Box::pin(Cursor::new(data)))
     }
 
     async fn write_file(
         &self,
-        _path: &RepoPath,
+        path: &RepoPath,
         contents: &mut (dyn AsyncRead + Send + Unpin),
     ) -> BackendResult<FileId> {
         let mut bytes = Vec::new();
         contents.read_to_end(&mut bytes).await.unwrap();
+
+        if self.workspace_attributes.applies_to(path) {
+            return crate::git_backend_consumingchaos::write_cdc_file(self, &bytes);
+        }
 
         let oid = self.write_blob(&bytes, "file")?;
         Ok(FileId::new(oid.as_bytes().to_vec()))
@@ -1116,8 +1147,20 @@ impl Backend for GitBackend {
                 .unwrap();
                 let value = match entry.mode().kind() {
                     gix::object::tree::EntryKind::Tree => {
-                        let id = TreeId::from_bytes(entry.oid().as_bytes());
-                        TreeValue::Tree(id)
+                        match crate::git_backend_consumingchaos::is_cdc_tree(
+                            &locked_repo,
+                            entry.oid(),
+                        )? {
+                            true => TreeValue::File {
+                                id: FileId::from_bytes(entry.oid().as_bytes()),
+                                executable: false,
+                                copy_id: CopyId::placeholder(),
+                            },
+                            false => {
+                                let id = TreeId::from_bytes(entry.oid().as_bytes());
+                                TreeValue::Tree(id)
+                            }
+                        }
                     }
                     gix::object::tree::EntryKind::Blob => {
                         let id = FileId::from_bytes(entry.oid().as_bytes());
@@ -1158,17 +1201,27 @@ impl Backend for GitBackend {
     async fn write_tree(&self, _path: &RepoPath, contents: &Tree) -> BackendResult<TreeId> {
         // Tree entries to be written must be sorted by Entry::filename(), which
         // is slightly different from the order of our backend::Tree.
-        let entries = contents
+        let locked_repo = self.lock_git_repo();
+        let cdc_mode = |id: &FileId| -> BackendResult<Option<gix::object::tree::EntryMode>> {
+            let oid = gix::ObjectId::from_bytes_or_panic(id.as_bytes());
+            if crate::git_backend_consumingchaos::is_cdc_tree(&locked_repo, &oid)? {
+                Ok(Some(gix::object::tree::EntryKind::Tree.into()))
+            } else {
+                Ok(None)
+            }
+        };
+        let mut entries: Vec<gix::objs::tree::Entry> = contents
             .entries()
-            .map(|entry| {
+            .map(|entry| -> BackendResult<_> {
                 let filename = BString::from(entry.name().as_internal_str());
-                match entry.value() {
+                Ok(match entry.value() {
                     TreeValue::File {
                         id,
                         executable: false,
                         copy_id: _, // TODO: Use the value
                     } => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Blob.into(),
+                        mode: cdc_mode(id)?
+                            .unwrap_or_else(|| gix::object::tree::EntryKind::Blob.into()),
                         filename,
                         oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
                     },
@@ -1177,7 +1230,8 @@ impl Backend for GitBackend {
                         executable: true,
                         copy_id: _, // TODO: Use the value
                     } => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::BlobExecutable.into(),
+                        mode: cdc_mode(id)?
+                            .unwrap_or_else(|| gix::object::tree::EntryKind::BlobExecutable.into()),
                         filename,
                         oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
                     },
@@ -1196,11 +1250,10 @@ impl Backend for GitBackend {
                         filename,
                         oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
                     },
-                }
+                })
             })
-            .sorted_unstable()
-            .collect();
-        let locked_repo = self.lock_git_repo();
+            .try_collect()?;
+        entries.sort_unstable();
         let oid = locked_repo
             .write_object(gix::objs::Tree { entries })
             .map_err(|err| BackendError::WriteObject {

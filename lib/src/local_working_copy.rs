@@ -90,6 +90,7 @@ use crate::fsmonitor::FsmonitorSettings;
 use crate::fsmonitor::WatchmanConfig;
 #[cfg(feature = "watchman")]
 use crate::fsmonitor::watchman;
+use crate::git_backend_consumingchaos::WorkspaceAttributes;
 use crate::gitignore::GitIgnoreFile;
 use crate::lock::FileLock;
 use crate::matchers::DifferenceMatcher;
@@ -1317,6 +1318,12 @@ impl TreeState {
         let (untracked_paths_tx, untracked_paths_rx) = channel();
         let (deleted_files_tx, deleted_files_rx) = channel();
 
+        let workspace_attributes = crate::git_backend_consumingchaos::load_workspace_attributes()
+            .map_err(|err| SnapshotError::Other {
+            message: "Failed to load .jjattributes".to_owned(),
+            err: Box::new(err),
+        })?;
+
         trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
             let snapshotter = FileSnapshotter {
                 tree_state: self,
@@ -1332,6 +1339,7 @@ impl TreeState {
                 error: OnceLock::new(),
                 progress: *progress,
                 max_new_file_size: *max_new_file_size,
+                workspace_attributes,
             };
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
@@ -1503,6 +1511,7 @@ struct FileSnapshotter<'a> {
     error: OnceLock<SnapshotError>,
     progress: Option<&'a SnapshotProgress<'a>>,
     max_new_file_size: u64,
+    workspace_attributes: WorkspaceAttributes,
 }
 
 impl FileSnapshotter<'_> {
@@ -1664,7 +1673,8 @@ impl FileSnapshotter<'_> {
                 })?;
                 if maybe_current_file_state.is_none()
                     && (metadata.len() > self.max_new_file_size
-                        && !self.force_tracking_matcher.matches(&path))
+                        && !self.force_tracking_matcher.matches(&path)
+                        && !self.workspace_attributes.applies_to(&path))
                 {
                     // Leave the large file untracked
                     let reason = UntrackedReason::FileTooLarge {
